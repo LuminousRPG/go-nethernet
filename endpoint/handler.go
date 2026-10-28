@@ -13,7 +13,6 @@ import (
 	"net/http"
 	"strconv"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"github.com/df-mc/go-nethernet"
@@ -82,7 +81,7 @@ func NewHandler() *Handler {
 	return c.New()
 }
 
-// ServeTLS is a utility method that set-ups an HTTP/TLS server on the specified address
+// ServeTLS is a utility method that sets up an HTTP/TLS server on the specified address
 // using the TLS certificate and key file.
 func (conf HandlerConfig) ServeTLS(address string, certFile, keyFile string) (*Handler, error) {
 	cert, err := tls.LoadX509KeyPair(certFile, keyFile)
@@ -98,6 +97,7 @@ func (conf HandlerConfig) ServeTLS(address string, certFile, keyFile string) (*H
 	return conf.serve(l)
 }
 
+// Serve is a utility method that sets up an HTTP server on the specified address.
 func (conf HandlerConfig) Serve(address string) (*Handler, error) {
 	l, err := net.Listen("tcp", address)
 	if err != nil {
@@ -106,6 +106,7 @@ func (conf HandlerConfig) Serve(address string) (*Handler, error) {
 	return conf.serve(l)
 }
 
+// serve starts an HTTP server using the provided listener and returns the Handler attached to it.
 func (conf HandlerConfig) serve(l net.Listener) (*Handler, error) {
 	h := conf.New()
 	var cancel context.CancelCauseFunc
@@ -125,13 +126,14 @@ func (conf HandlerConfig) serve(l net.Listener) (*Handler, error) {
 	h.closeFunc = func() error {
 		return server.Close()
 	}
+	h.addr = l.Addr()
 	return h, nil
 }
 
 // maxSDPBodySize caps HTTP SDP offer and answer bodies at 1 MiB.
 const maxSDPBodySize int64 = 1 << 20
 
-// ServeTLS is a utility method that set-ups an HTTP/TLS server on the specified
+// ServeTLS is a utility method that sets up an HTTP/TLS server on the specified
 // address using the TLS certificate and key file. It is equivalent of
 // calling HandlerConfig{}.ServeTLS().
 func ServeTLS(address string, certFile, keyFile string) (*Handler, error) {
@@ -139,6 +141,8 @@ func ServeTLS(address string, certFile, keyFile string) (*Handler, error) {
 	return conf.ServeTLS(address, certFile, keyFile)
 }
 
+// Serve is a utility method that sets up an HTTP server on the specified address.
+// It is equivalent of calling HandlerConfig{}.Serve().
 func Serve(address string) (*Handler, error) {
 	var conf HandlerConfig
 	return conf.Serve(address)
@@ -174,6 +178,7 @@ type Handler struct {
 
 	closeFunc func() error
 	ctx       context.Context
+	addr      net.Addr
 
 	// notifier is the active Listener receiving HTTP endpoint offers.
 	// The HTTP request-response model supports only one Listener because
@@ -183,7 +188,8 @@ type Handler struct {
 	notifierMu sync.RWMutex
 
 	// status atomically stores the current server status assigned to the Handler.
-	status atomic.Pointer[Status]
+	status   []byte
+	statusMu sync.RWMutex
 
 	// disableNotifyTypeCheck permits tests to register lightweight Notifier stubs.
 	disableNotifyTypeCheck bool
@@ -275,6 +281,13 @@ func (h *Handler) NetworkID() string {
 	return h.conf.NetworkID
 }
 
+// Addr returns the TCP address used by the underlying HTTP server.
+// It may be nil if the Handler has not been created using [HandlerConfig.Serve]
+// or [HandlerConfig.ServeTLS].
+func (h *Handler) Addr() net.Addr {
+	return h.addr
+}
+
 // PongData is a no-op implementation of [nethernet.Signaling.PongData].
 // It may become meaningful in the future if Mojang introduces an HTTP
 // endpoint for serving MOTDs.
@@ -287,33 +300,45 @@ func (h *Handler) PongData(data []byte) {
 		h.conf.Logger.Error("error parsing RakNet pong data", "err", err)
 		return
 	}
-	h.status.Store(&status)
+	h.Status(status)
 }
 
+// Status sets the server status that the Handler responds with for HTTP requests
+// sent by clients. Note that if the upstream game listener also provides pong data
+// via [Handler.PongData], that data will take precedence, since [Handler.PongData]
+// overwrites the status set here. Callers can set [HandlerConfig.DisablePongData]
+// to true to disable this behavior.
 func (h *Handler) Status(status Status) {
-	h.status.Store(&status)
+	b, err := json.Marshal(status)
+	if err != nil {
+		h.conf.Logger.Error("error encoding status", "error", err)
+		return
+	}
+	h.statusMu.Lock()
+	h.status = b
+	h.statusMu.Unlock()
 }
 
+// handlePing handles a GET request to the /v1/join endpoint.
+// It responds with the current server status, if one has been set by
+// the caller via [Handler.Status] or by the upstream game listener via
+// [Handler.PongData]. Otherwise, it responds with an empty body.
 func (h *Handler) handlePing(w http.ResponseWriter, req *http.Request) {
 	req.Close = true // Do not keep-alive the TCP connection.
 	log := h.conf.Logger.With("method", req.Method, "url", req.URL)
 
-	status := h.status.Load()
-	if status == nil {
-		log.Debug("could not respond with pong data")
+	h.statusMu.RLock()
+	status := h.status
+	h.statusMu.RUnlock()
+	if len(status) == 0 {
+		log.Debug("no status was assigned to Handler")
 		w.WriteHeader(http.StatusOK)
-		return
-	}
-	b, err := json.Marshal(status)
-	if err != nil {
-		log.Error("error encoding pong data", "err", err)
-		writeText(w, http.StatusInternalServerError, "An error has occurred while handling this request.")
 		return
 	}
 
 	w.Header().Set("Content-Type", "application/json")
-	_, _ = w.Write(b)
 	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write(status)
 }
 
 // handleOffer handles a POST request to the /v1/join/{networkID} endpoint.
@@ -384,7 +409,8 @@ func (h *Handler) handleOffer(w http.ResponseWriter, req *http.Request) {
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte(signal.Data))
 	case nethernet.SignalTypeError:
-		writeText(w, http.StatusBadRequest, fmt.Sprintf("Negotiation failed with error code: %s", signal.Data))
+		w.WriteHeader(http.StatusInternalServerError)
+		_, _ = w.Write([]byte(signal.Data))
 	default:
 		log.Error("unexpected negotiation result", slog.String("signal", signal.String()))
 		writeText(w, http.StatusInternalServerError, "An error has occurred while handling this request")
