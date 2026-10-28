@@ -238,7 +238,10 @@ func (l *Listener) write(pk Packet, addr net.Addr) error {
 func (l *Listener) handlePacket(data []byte, addr net.Addr) error {
 	pk, senderID, err := Unmarshal(data)
 	if err != nil {
-		return fmt.Errorf("decode: %w", err)
+		// Anything on the network may send to the discovery port, so a datagram
+		// that is not a discovery packet is noise rather than an error.
+		l.conf.Log.Debug("ignored non-discovery packet", slog.Any("error", err), "from", addr)
+		return nil
 	}
 
 	if senderID == l.conf.NetworkID {
