@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"net"
 	"sync"
+	"time"
 
 	"github.com/pion/webrtc/v4"
 )
@@ -94,6 +95,7 @@ func wrapDataChannel(channel *webrtc.DataChannel, reliability MessageReliability
 		close:   make(chan struct{}),
 	}
 	ch.OnMessage(func(msg webrtc.DataChannelMessage) {
+		conn.lastReceived.Store(time.Now().UnixNano())
 		if err := ch.handleMessage(msg.Data); err != nil {
 			if errors.Is(err, net.ErrClosed) {
 				conn.log.Debug("message dropped due to closure of data channel",
@@ -110,7 +112,9 @@ func wrapDataChannel(channel *webrtc.DataChannel, reliability MessageReliability
 	})
 	ch.OnClose(func() {
 		// This handler function itself is invoked while holding an internal lock, so call close in a goroutine to avoid deadlock.
-		go conn.close(fmt.Errorf("nethernet: data channel %q closed by remote peer", ch.Label()))
+		go func() {
+			conn.close(fmt.Errorf("nethernet: data channel %q closed by remote peer (%s)", ch.Label(), conn.transportState()))
+		}()
 	})
 	return ch
 }

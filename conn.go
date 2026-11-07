@@ -81,6 +81,13 @@ type Conn struct {
 	readMu  sync.Mutex
 	readBuf []byte
 
+	// lastReceived is when the last message segment arrived from the remote
+	// connection, and iceDisconnected when the ICE transport last entered the
+	// disconnected state (zero while connected), both in Unix nanoseconds. They
+	// are reported with the cause of a transport closure, which otherwise does
+	// not tell a peer that ended the connection from one that went silent.
+	lastReceived, iceDisconnected atomic.Int64
+
 	// once ensures that the Conn transports are closed only once.
 	once sync.Once
 
@@ -367,6 +374,13 @@ func (conn *Conn) Close() (err error) {
 	return conn.close(net.ErrClosed)
 }
 
+// SCTPRTOMax is the longest the SCTP transport of a listener waits before sending data again that the remote
+// connection has not acknowledged. Each retransmission doubles the wait, and with the SCTP default of 60
+// seconds a few seconds of packet loss, common on mobile networks, leave the game stalled for tens of seconds
+// after the network has recovered, long enough for the client to give up on the connection. An API given to
+// ListenConfig should set it with [webrtc.SettingEngine.SetSCTPRTOMax].
+const SCTPRTOMax = 3 * time.Second
+
 // isTerminalICEState reports whether an ICE transport can no longer recover.
 func isTerminalICEState(state webrtc.ICETransportState) bool {
 	return state == webrtc.ICETransportStateClosed || state == webrtc.ICETransportStateFailed
@@ -376,30 +390,62 @@ func isTerminalICEState(state webrtc.ICETransportState) bool {
 // associated with the Conn. It also ensures that the Conn is closed if an unrecoverable
 // error has occurred in any of the underlying transports and data channels.
 func (conn *Conn) handleTransports() {
+	conn.lastReceived.Store(time.Now().UnixNano())
 	conn.ice.OnConnectionStateChange(func(state webrtc.ICETransportState) {
+		switch state {
+		case webrtc.ICETransportStateDisconnected:
+			conn.iceDisconnected.Store(time.Now().UnixNano())
+		case webrtc.ICETransportStateConnected, webrtc.ICETransportStateCompleted:
+			conn.iceDisconnected.Store(0)
+		default:
+		}
 		if isTerminalICEState(state) {
 			// This handler function itself is invoked while holding an internal lock, so call close in a goroutine to avoid deadlock.
-			go conn.close(fmt.Errorf("nethernet: ICE transport entered unrecoverable state: %s", state))
+			go func() {
+				conn.close(fmt.Errorf("nethernet: ICE transport entered unrecoverable state: %s (%s)", state, conn.transportState()))
+			}()
 		}
 	})
 	conn.dtls.OnStateChange(func(state webrtc.DTLSTransportState) {
 		switch state {
 		case webrtc.DTLSTransportStateClosed, webrtc.DTLSTransportStateFailed:
 			// This handler function itself is invoked while holding an internal lock, so call close in a goroutine to avoid deadlock.
-			go conn.close(fmt.Errorf("nethernet: DTLS transport entered unrecoverable state: %s", state))
+			go func() {
+				conn.close(fmt.Errorf("nethernet: DTLS transport entered unrecoverable state: %s (%s)", state, conn.transportState()))
+			}()
 		default:
 		}
 	})
 	conn.sctp.OnClose(func(err error) {
-		var e error
-		if err != nil {
-			e = fmt.Errorf("nethernet: SCTP transport closed: %w", err)
-		} else {
-			e = errors.New("nethernet: SCTP transport closed")
-		}
 		// This handler function itself is invoked while holding an internal lock, so call close in a goroutine to avoid deadlock.
-		go conn.close(e)
+		// The transport state is read there too, as it takes the transports' locks.
+		go func() {
+			if err != nil {
+				conn.close(fmt.Errorf("nethernet: SCTP transport closed (%s): %w", conn.transportState(), err))
+			} else {
+				conn.close(fmt.Errorf("nethernet: SCTP transport closed (%s)", conn.transportState()))
+			}
+		}()
 	})
+}
+
+// transportState describes how long the remote connection has been silent and
+// the state of the ICE and DTLS transports, for the cause of a closure. A peer
+// that ends the connection itself is closed while still sending; one whose
+// network failed has been silent for seconds, with ICE disconnected.
+func (conn *Conn) transportState() string {
+	now := time.Now()
+	s := fmt.Sprintf("idle %s, ice %s", now.Sub(time.Unix(0, conn.lastReceived.Load())).Round(100*time.Millisecond), conn.ice.State())
+	if at := conn.iceDisconnected.Load(); at != 0 {
+		s += fmt.Sprintf(" for %s", now.Sub(time.Unix(0, at)).Round(100*time.Millisecond))
+	}
+	s += fmt.Sprintf(", dtls %s", conn.dtls.State())
+	// Data the remote connection has not acknowledged: a peer that stopped
+	// receiving closes while still sending, with this piled up.
+	if ch := conn.channel(MessageReliabilityReliable); ch != nil {
+		s += fmt.Sprintf(", unacked %d bytes", ch.BufferedAmount())
+	}
+	return s
 }
 
 // handleSignal handles an incoming Signal signaled from the remote connection.

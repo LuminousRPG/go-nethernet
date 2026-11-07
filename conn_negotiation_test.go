@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"net"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -476,4 +477,54 @@ func TestRemoteErrorsAfterNegotiation(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestRemoteCloseCauseReportsTransportState checks that a connection the remote end closes
+// reports how long the remote was silent, so a peer that left is told from one that went quiet.
+func TestRemoteCloseCauseReportsTransportState(t *testing.T) {
+	client, server := newMemorySignalingPair("1", "2")
+	defer client.close()
+	defer server.close()
+
+	l, err := (ListenConfig{AllowAnonymous: true}).Listen(server)
+	if err != nil {
+		t.Fatalf("Listen() error = %v", err)
+	}
+	defer l.Close()
+
+	accepted := make(chan net.Conn, 1)
+	go func() {
+		if conn, err := l.Accept(); err == nil {
+			accepted <- conn
+		}
+	}()
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	conn, err := (Dialer{}).DialContext(ctx, server.NetworkID(), client)
+	if err != nil {
+		t.Fatalf("DialContext() error = %v", err)
+	}
+	var serverConn *Conn
+	select {
+	case c := <-accepted:
+		serverConn = c.(*Conn)
+	case <-ctx.Done():
+		t.Fatal("Accept() timed out")
+	}
+	defer serverConn.Close()
+
+	_ = conn.Close()
+	select {
+	case <-serverConn.Context().Done():
+	case <-ctx.Done():
+		t.Fatal("server connection was not closed after the remote closed")
+	}
+	cause := context.Cause(serverConn.Context()).Error()
+	for _, want := range []string{"idle ", "ice ", "dtls ", "unacked "} {
+		if !strings.Contains(cause, want) {
+			t.Errorf("close cause %q does not report %q", cause, strings.TrimSpace(want))
+		}
+	}
+	t.Log(cause)
 }
